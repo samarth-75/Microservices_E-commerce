@@ -1,0 +1,110 @@
+# ============================================================
+# CommerceSphere — Docker Compose
+# Brings up infrastructure services + API Gateway.
+# Usage: docker-compose up -d
+# ============================================================
+# Reads from .env in the same directory (copy .env.example → .env first).
+
+services:
+  # ---- PostgreSQL --------------------------------------------
+  # Used by: Auth, User, Order, Payment, Inventory, Analytics
+  postgres:
+    image: postgres:16-alpine
+    container_name: cs-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-commercesphere}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_pg}
+      POSTGRES_DB: ${POSTGRES_DB:-commercesphere}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-commercesphere}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---- MongoDB -----------------------------------------------
+  # Used by: Catalog Service (document store for products/categories)
+  mongo:
+    image: mongo:7
+    container_name: cs-mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:-commercesphere}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:-changeme_mongo}
+    ports:
+      - "${MONGO_PORT:-27017}:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---- Redis -------------------------------------------------
+  # Used by: Cache (Catalog), Sessions, Cart storage
+  redis:
+    image: redis:7-alpine
+    container_name: cs-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---- RabbitMQ ----------------------------------------------
+  # Event bus for async communication (ORDER_CREATED, INVENTORY_RESERVED, etc.)
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: cs-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-commercesphere}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-changeme_rabbit}
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - rabbit_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---- API Gateway -------------------------------------------
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    container_name: cs-gateway
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+      NODE_ENV: development
+    ports:
+      - "${GATEWAY_PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  pg_data:
+  mongo_data:
+  redis_data:
+  rabbit_data:
