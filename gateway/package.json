@@ -1,6 +1,6 @@
 {
   "name": "commercesphere-gateway",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "CommerceSphere API Gateway — routes, auth middleware, rate limiting",
   "main": "src/index.js",
   "scripts": {
@@ -11,6 +11,7 @@
     "cors": "^2.8.5",
     "express": "^4.21.0",
     "helmet": "^7.1.0",
+    "http-proxy-middleware": "^3.0.0",
     "morgan": "^1.10.0",
     "uuid": "^10.0.0"
   },

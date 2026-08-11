@@ -119,3 +119,43 @@ Scaling:
 | Trade-off | All infra in one Compose file is simple but means everything runs on one machine. Production would use managed services (RDS, ElastiCache, CloudAMQP) or Kubernetes. The Compose setup is intentionally "portable dev environment," not production topology. |
 | Likely question | "Why healthchecks on every service?" → So dependent services (like the gateway) don't start before their dependencies are ready. Without healthchecks, the gateway could start and crash because Postgres isn't accepting connections yet, causing confusing startup failures. |
 
+---
+
+### JWT Auth & Refresh Token Rotation — auth-service (Phase 1)
+
+| Field | Notes |
+|---|---|
+| Problem | Users need to authenticate once and stay logged in without re-entering credentials every 15 minutes, while minimizing damage if a token is intercepted. |
+| Design choice | Dual-token strategy: short-lived access token (15 min, stateless JWT) + long-lived refresh token (7 days, stored as SHA-256 hash in Postgres). On each refresh, the old token is revoked and a new pair is issued (rotation). Two separate secrets for defense in depth. |
+| Flow | `POST /login → bcrypt.compare → issue accessToken + refreshToken → store SHA256(refreshToken) in DB` / `POST /refresh → verify JWT → lookup hash in DB → revoke old → issue new pair → store new hash` |
+| Code pointer | `services/auth-service/src/routes/auth.routes.js` (all five endpoints), `src/utils/jwt.js` (token gen/verify), `src/utils/hash.js` (SHA-256), `src/models/RefreshToken.js` (DB schema) |
+| Trade-off | Refresh tokens stored in Postgres, not Redis — simpler and auditable, but slower lookups. Production could use Redis for active tokens + Postgres for audit log. SHA-256 instead of bcrypt for token hashing — tokens are high-entropy, so bcrypt's slowness adds latency without security benefit. |
+| Likely question | "Why refresh tokens instead of just long-lived access tokens?" → Long-lived access tokens can't be revoked (they're stateless). A stolen 7-day access token gives an attacker 7 days of access with no way to stop it. With refresh rotation, (a) access tokens expire in 15 min, limiting the damage window, and (b) refresh tokens are one-time-use, so theft is detected on the next legitimate refresh. |
+
+---
+
+### RBAC (Role-Based Access Control) — auth-service (Phase 1)
+
+| Field | Notes |
+|---|---|
+| Problem | Different users need different permissions — customers shouldn't access admin endpoints (catalog CRUD, analytics), and admin actions should be verifiable. |
+| Design choice | Simple two-role ENUM on the User model (`admin`, `customer`). Middleware factory: `authorize('admin')` checks `req.user.role` set by the `authenticate` middleware. Two-step chain: authenticate → authorize. |
+| Flow | `Request → authenticate (verify JWT, set req.user) → authorize('admin') (check role) → handler` |
+| Code pointer | `services/auth-service/src/middleware/authenticate.js`, `services/auth-service/src/middleware/authorize.js`, User model role ENUM in `src/models/User.js` |
+| Trade-off | ENUM roles are simple but not granular — "admin can do everything" vs. fine-grained permissions. For this project, two roles are sufficient and easy to explain. If roles grew complex (e.g. "inventory manager", "support agent"), I'd switch to a permissions table with role-permission mappings. |
+| Likely question | "How would you add more granular permissions?" → Replace the ENUM with a roles table and a role_permissions join table. The authorize middleware would check `req.user.permissions.includes('catalog:write')` instead of `req.user.role === 'admin'`. The middleware interface stays the same, only the lookup changes. |
+
+---
+
+### Rate Limiting on Auth Endpoints — auth-service (Phase 1)
+
+| Field | Notes |
+|---|---|
+| Problem | Auth endpoints (login, signup) are prime targets for brute-force password guessing and credential stuffing attacks. Without limits, an attacker could try thousands of passwords per second. |
+| Design choice | `express-rate-limit` middleware: 10 requests per 15-minute window per IP on /signup, /login, /refresh. Returns 429 with Retry-After header. In-memory store for dev simplicity. |
+| Flow | `Request → rateLimiter (check IP counter) → if under limit, proceed → else 429 Too Many Requests` |
+| Code pointer | `services/auth-service/src/middleware/rateLimiter.js`, applied in `src/routes/auth.routes.js` on signup/login/refresh routes |
+| Trade-off | In-memory store means rate limits reset on service restart and don't work across multiple instances. Production fix: use `rate-limit-redis` with the shared Redis instance. 10/15min is strict — real apps might use 5/min for login + CAPTCHA after 3 failures. |
+| Likely question | "What happens if you have multiple auth-service instances behind a load balancer?" → Each instance has its own in-memory counter, so an attacker could send 10 requests to each instance (10 × N total). Fix: use a shared Redis store so all instances share the same counter. That's a one-line config change with `rate-limit-redis`. |
+
+
