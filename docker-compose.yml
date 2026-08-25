@@ -113,6 +113,37 @@ services:
       retries: 5
       start_period: 30s
 
+  # ---- Catalog Service ----------------------------------------
+  # Handles products, categories, search, image upload, and caching.
+  # Database: MongoDB (document store for flexible product attributes).
+  # Cache: Redis (cache-aside for product lists, details, categories).
+  catalog-service:
+    build:
+      context: ./services/catalog-service
+      dockerfile: Dockerfile
+    container_name: cs-catalog-service
+    restart: unless-stopped
+    environment:
+      PORT: 3002
+      NODE_ENV: development
+      MONGO_URI: mongodb://${MONGO_INITDB_ROOT_USERNAME:-commercesphere}:${MONGO_INITDB_ROOT_PASSWORD:-changeme_mongo}@mongo:27017/commercesphere_catalog?authSource=admin
+      REDIS_URL: redis://redis:6379
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-dev_access_secret_change_in_production}
+      UPLOAD_DIR: uploads
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - catalog_uploads:/app/uploads
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3002/health', (r) => { process.exit(r.statusCode === 200 ? 0 : 1) }).on('error', () => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
   # ---- API Gateway -------------------------------------------
   gateway:
     build:
@@ -124,6 +155,7 @@ services:
       PORT: 3000
       NODE_ENV: development
       AUTH_SERVICE_URL: http://auth-service:3001
+      CATALOG_SERVICE_URL: http://catalog-service:3002
     ports:
       - "${GATEWAY_PORT:-3000}:3000"
     depends_on:
@@ -137,9 +169,12 @@ services:
         condition: service_healthy
       auth-service:
         condition: service_healthy
+      catalog-service:
+        condition: service_healthy
 
 volumes:
   pg_data:
   mongo_data:
   redis_data:
   rabbit_data:
+  catalog_uploads:

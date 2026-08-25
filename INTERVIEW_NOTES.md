@@ -158,4 +158,55 @@ Scaling:
 | Trade-off | In-memory store means rate limits reset on service restart and don't work across multiple instances. Production fix: use `rate-limit-redis` with the shared Redis instance. 10/15min is strict — real apps might use 5/min for login + CAPTCHA after 3 failures. |
 | Likely question | "What happens if you have multiple auth-service instances behind a load balancer?" → Each instance has its own in-memory counter, so an attacker could send 10 requests to each instance (10 × N total). Fix: use a shared Redis store so all instances share the same counter. That's a one-line config change with `rate-limit-redis`. |
 
+---
+
+### Catalog CRUD + MongoDB — catalog-service (Phase 2)
+
+| Field | Notes |
+|---|---|
+| Problem | Products have heterogeneous attributes (T-shirts have size/color, laptops have RAM/storage). A relational DB would need an EAV table or JSONB — both are awkward. Need flexible schema per product without migrations. |
+| Design choice | MongoDB with Mongoose for the catalog. Products use a `Map<String, String>` field for variable attributes. Categories are a separate collection referenced by ObjectId. Soft deletes (`isActive: false`) instead of hard deletes — preserves data for analytics and order history references. |
+| Flow | `Admin → Gateway → Catalog Service → Joi validation → Mongoose → MongoDB` (writes) / `Customer → Gateway → Catalog Service → Redis check → MongoDB (on miss) → Redis write → response` (reads) |
+| Code pointer | `services/catalog-service/src/models/Product.js` (schema + indexes), `src/models/Category.js` (auto-slug generation), `src/routes/product.routes.js` (CRUD + pagination/filter/sort/search), `src/routes/category.routes.js` |
+| Trade-off | Using Mongoose adds overhead vs. the raw MongoDB driver, but provides schema validation, middleware hooks, and population (join-like) features that make the code more readable and maintainable. In a high-throughput system, you might drop down to the raw driver for hot paths and keep Mongoose for admin operations. |
+| Likely question | "Why MongoDB for catalog but PostgreSQL for orders?" → Catalog data is read-heavy, schema-flexible, and doesn't need ACID transactions across multiple tables. Orders need ACID guarantees (payment ↔ inventory ↔ order must be consistent), relational joins (order → line items → products), and strong schema enforcement — PostgreSQL is the right fit there. |
+
+---
+
+### Redis Cache-Aside Pattern — catalog-service (Phase 2)
+
+| Field | Notes |
+|---|---|
+| Problem | Product listing and detail pages are the highest-traffic endpoints. Every page view hits the database. Without caching, the catalog service becomes the bottleneck as traffic grows, and MongoDB queries (especially with filters + sorts) add latency. |
+| Design choice | Cache-aside (lazy-loading) pattern with Redis: check cache → miss → query DB → write to cache → return. TTLs: product lists 5 min, product details 30 min, categories 1 hr. Cache keys use a deterministic MD5 hash of query params for list queries. All cache operations are wrapped in try/catch — Redis failure degrades to slower DB reads, never crashes. |
+| Flow | `GET /products → check Redis (key: catalog:products:list:<hash>) → HIT: return cached → MISS: query MongoDB → write to Redis (EX 300s) → return` / `PUT /products/:id → update MongoDB → DEL cache key → SCAN+DEL all list keys` |
+| Code pointer | `services/catalog-service/src/utils/cache.js` (getFromCache, setCache, invalidateCacheByKeys, invalidateCacheByPattern, hashQuery), integration in `src/routes/product.routes.js` GET handlers |
+| Trade-off | Invalidating ALL list cache keys on any product write is brute-force but correct — we can't predict which paginated/filtered lists include the modified product. The cost is acceptable because: (a) list TTL is short (5 min), (b) admin writes are rare vs. customer reads, (c) SCAN is non-blocking. A smarter approach would use RabbitMQ events to invalidate only affected list queries, but that adds complexity for minimal gain at this scale. |
+| Likely question | "What is cache stampede and how would you prevent it?" → When a popular key expires, many concurrent requests see a miss and all query MongoDB simultaneously. Mitigations: (1) Redlock mutex — first request locks, queries DB, caches; others wait. (2) Probabilistic early expiration — refresh before actual TTL. (3) Never-expire + background refresh worker. Not implemented here (low traffic), but the architecture supports adding it. See `docs/caching.md` for details. |
+
+---
+
+### Image Upload Architecture — catalog-service (Phase 2)
+
+| Field | Notes |
+|---|---|
+| Problem | Products need images. Need to handle file upload, storage, and serving — but don't want to over-engineer with S3/CDN for a dev/portfolio project. |
+| Design choice | `multer` for multipart form handling → local disk storage (`uploads/products/<uuid>.<ext>`) → Express static file serving. UUID filenames prevent collisions. MIME type filter (jpeg/png/webp only), 5MB max per file, 5 files per upload. Documented as a dev stand-in for CDN/S3. |
+| Flow | `POST /products (multipart/form-data) → multer (validate file type/size → save to disk) → route handler (store paths in product.images[]) → response` / `GET /uploads/products/<filename> → Express static middleware → file response` |
+| Code pointer | `services/catalog-service/src/middleware/upload.js` (multer config + error handler), image path assignment in `src/routes/product.routes.js` POST/PUT handlers |
+| Trade-off | Local disk doesn't scale — images are lost if the container is replaced (mitigated with a Docker volume), and there's no CDN/edge caching. Production would use signed URLs for direct-to-S3 upload (bypassing the service entirely), CloudFront CDN for global delivery, and a resize worker for thumbnails. The local approach is fine for demonstrating the upload flow and discussing the production architecture. |
+| Likely question | "How would you handle image uploads at scale?" → (1) Client gets a signed S3 URL from the service, uploads directly to S3 (service never touches the bytes). (2) S3 event triggers a Lambda to generate thumbnails. (3) CloudFront CDN serves images globally. (4) Product document stores only the CDN URL, not the raw S3 path. This eliminates the service as a bottleneck for uploads and serving. |
+
+---
+
+### Catalog Search — catalog-service (Phase 2)
+
+| Field | Notes |
+|---|---|
+| Problem | Customers need to find products by name or description. Basic search is table stakes for any e-commerce platform. |
+| Design choice | MongoDB text index on `name` (weight 10) and `description` (weight 5). Uses `$text` operator with `$meta: textScore` for relevance ranking. Combined with filters (category, price, brand) and pagination. No typo tolerance, no autocomplete — documented as a "good enough" implementation with a clear upgrade path. |
+| Flow | `GET /products?search=wireless+headphones → Joi validates query → check Redis → MongoDB $text query + $meta textScore sort → cache result → return` |
+| Code pointer | `services/catalog-service/src/models/Product.js` (text index definition with weights), `src/routes/product.routes.js` GET `/` handler (filter building + textScore projection + sort) |
+| Trade-off | MongoDB text search is simple and requires no additional infrastructure, but lacks typo tolerance, fuzzy matching, autocomplete, and faceted search. For a production e-commerce site, you'd add Elasticsearch (or MongoDB Atlas Search) as a dedicated search layer: products are indexed on write via an event consumer, and search queries go to Elasticsearch instead of MongoDB. The catalog MongoDB remains the source of truth for CRUD. |
+| Likely question | "How would you add typo-tolerant search?" → Add Elasticsearch as a separate service. On product create/update, publish an event to RabbitMQ → a search-indexer consumer writes to Elasticsearch. Search queries hit Elasticsearch for matching IDs, then fetch full product documents from MongoDB (or denormalize into Elasticsearch). This keeps MongoDB as the write source of truth and Elasticsearch as a read-optimized search index. |
 

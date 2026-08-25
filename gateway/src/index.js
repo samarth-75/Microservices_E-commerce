@@ -8,8 +8,9 @@
  *   4. Proxy routes to downstream services
  *   5. JWT auth middleware for protected routes (available for Phase 2+)
  *
- * Phase 0 stub route (/api/catalog/ping) is kept until catalog-service exists.
- * Phase 1 adds: proxy to auth-service at /api/auth/*
+ * Phase 0: stub route (/api/catalog/ping) — removed in Phase 2.
+ * Phase 1: proxy to auth-service at /api/auth/*
+ * Phase 2: proxy to catalog-service at /api/catalog/*
  *
  * IMPORTANT: Proxy routes are registered BEFORE express.json() body parsing.
  * http-proxy-middleware needs the raw request stream — if express.json() runs
@@ -28,6 +29,7 @@ const PORT = process.env.PORT || 3000;
 
 // Service URLs — resolved via Docker Compose service names
 const AUTH_SERVICE_URL = process.env.AUTH_SERVICE_URL || 'http://auth-service:3001';
+const CATALOG_SERVICE_URL = process.env.CATALOG_SERVICE_URL || 'http://catalog-service:3002';
 
 // ---------------------------------------------------------------------------
 // Pre-proxy middleware (must run before proxies AND before body parsing)
@@ -99,6 +101,30 @@ app.use(
   })
 );
 
+/**
+ * /api/catalog/* → Catalog Service
+ *
+ * All catalog requests (products, categories, search) are proxied to the
+ * catalog-service container. The gateway strips /api/catalog and forwards
+ * to /catalog.
+ *
+ * Same pattern as the auth proxy — pathRewrite uses a function because
+ * Express strips the mount path before the proxy sees it.
+ */
+app.use(
+  '/api/catalog',
+  createProxyMiddleware({
+    target: CATALOG_SERVICE_URL,
+    changeOrigin: true,
+    pathRewrite: (path) => `/catalog${path}`,
+    on: {
+      proxyReq: (proxyReq, req) => {
+        proxyReq.setHeader('x-request-id', req.id);
+      },
+    },
+  })
+);
+
 // ---------------------------------------------------------------------------
 // Body parsing — AFTER proxies (proxied routes don't need gateway-side parsing)
 // ---------------------------------------------------------------------------
@@ -122,19 +148,8 @@ app.get('/health', (_req, res) => {
   });
 });
 
-/**
- * GET /api/catalog/ping
- * Phase 0 stub — proves the gateway can route requests to a "service".
- * In Phase 2 this will be replaced by a real proxy to the Catalog Service.
- */
-app.get('/api/catalog/ping', (req, res) => {
-  res.json({
-    message: 'catalog pong',
-    source: 'gateway-stub',
-    requestId: req.id,
-    note: 'This is a Phase 0 stub. Will proxy to catalog-service in Phase 2.',
-  });
-});
+// Phase 0 stub route (/api/catalog/ping) has been removed.
+// Catalog requests are now proxied to the real catalog-service (Phase 2).
 
 // ---------------------------------------------------------------------------
 // 404 catch-all
