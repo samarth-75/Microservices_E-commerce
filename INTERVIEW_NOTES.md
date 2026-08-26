@@ -210,3 +210,41 @@ Scaling:
 | Trade-off | MongoDB text search is simple and requires no additional infrastructure, but lacks typo tolerance, fuzzy matching, autocomplete, and faceted search. For a production e-commerce site, you'd add Elasticsearch (or MongoDB Atlas Search) as a dedicated search layer: products are indexed on write via an event consumer, and search queries go to Elasticsearch instead of MongoDB. The catalog MongoDB remains the source of truth for CRUD. |
 | Likely question | "How would you add typo-tolerant search?" → Add Elasticsearch as a separate service. On product create/update, publish an event to RabbitMQ → a search-indexer consumer writes to Elasticsearch. Search queries hit Elasticsearch for matching IDs, then fetch full product documents from MongoDB (or denormalize into Elasticsearch). This keeps MongoDB as the write source of truth and Elasticsearch as a read-optimized search index. |
 
+---
+
+### Redis as Primary Data Store — cart-service (Phase 3)
+
+| Field | Notes |
+|---|---|
+| Problem | Shopping carts need sub-millisecond latency for add/remove operations (user clicks "Add to Cart" and expects instant feedback). Carts are ephemeral — abandoned carts should auto-expire without a cleanup job. |
+| Design choice | Redis as the **primary store** (not just a cache). Cart data lives exclusively in Redis — no backing MongoDB or PostgreSQL. Uses Redis Hash data structure: key = `cart:user:<id>` or `cart:guest:<id>`, field = productId, value = JSON of item. TTL: 7 days for guests, 30 days for users, refreshed on every operation. |
+| Flow | `POST /cart/items → optionalAuth → resolveCartId → validate → REST call to catalog-service → HSET cart:<key> <productId> <JSON> → EXPIRE <key> <ttl>` |
+| Code pointer | `services/cart-service/src/config/redis.js` (maxRetriesPerRequest=3, NOT null — errors propagate because Redis IS the primary store), `src/utils/cartHelpers.js` (Hash operations), `src/middleware/resolveCartId.js` (identity resolution) |
+| Trade-off | Redis is volatile by default — data can be lost on restart. Acceptable for carts (annoying, not catastrophic). Production mitigation: Redis AOF/RDB persistence, or Redis Cluster with replicas. Contrast with catalog caching where Redis failure degrades gracefully (cache miss → DB read). Here, Redis failure = service failure. That's why `maxRetriesPerRequest=3` (throws on error) instead of `null` (swallows errors). |
+| Likely question | "Why not use PostgreSQL for carts like you do for orders?" → Orders need ACID guarantees, relational joins, and permanent storage. Carts need speed, TTL, and ephemeral storage. Using PostgreSQL for carts would add latency (disk I/O), require a cleanup cron for abandoned carts, and waste relational features (no joins needed). Redis Hashes give O(1) per-item access and built-in TTL — the right tool for this data shape. |
+
+---
+
+### Guest Cart + Merge on Login — cart-service (Phase 3)
+
+| Field | Notes |
+|---|---|
+| Problem | E-commerce sites lose sales if they force registration before adding to cart. Guests need carts too. When a guest logs in, their anonymous cart items shouldn't disappear — they need to be merged into the user's cart. |
+| Design choice | Guest carts use a client-generated UUID sent via `x-guest-id` header (stored in localStorage). The `optionalAuth` middleware tries JWT auth but doesn't 401 on failure — it sets `req.user = null`. The `resolveCartId` middleware resolves `cart:user:<id>` or `cart:guest:<id>` based on auth state. On login, frontend calls `POST /cart/merge { guestId }` — guest items are merged into the user cart, with user items taking precedence for conflicts. |
+| Flow | `Guest adds items → cart:guest:<guestId>. Guest logs in → frontend calls POST /cart/merge with JWT + { guestId }. Cart service: HGETALL guest cart → HGETALL user cart → for each guest item not in user cart, HSET into user cart → DEL guest cart → return merged cart.` |
+| Code pointer | `services/cart-service/src/middleware/optionalAuth.js` (JWT-or-null pattern), `src/middleware/resolveCartId.js` (identity resolution), `src/utils/cartHelpers.js` → `mergeCarts()`, `src/routes/cart.routes.js` → `POST /merge` |
+| Trade-off | User items take precedence over guest items (same product → keep user's quantity). Alternative: sum quantities on merge. We chose precedence because the user's logged-in action is more intentional than a guest browse. The `x-guest-id` header approach is simple but not secure — a malicious user could guess/enumerate guest IDs. Production fix: signed cookies or short-lived opaque tokens. Acceptable for a portfolio project. |
+| Likely question | "What happens if the user has 50 items and the guest has 50 items?" → The merge adds all non-duplicate guest items. We don't enforce a max cart size here, but production would: reject the merge if it exceeds a limit (e.g. 99 items), or merge up to the limit and discard the rest with a warning. |
+
+---
+
+### Cross-Service Communication (Cart → Catalog) — cart-service (Phase 3)
+
+| Field | Notes |
+|---|---|
+| Problem | When adding an item to the cart, we need to verify the product exists and is active (not soft-deleted). Cart service has no access to MongoDB (database-per-service pattern) — it can't query catalog data directly. |
+| Design choice | Synchronous REST call from cart-service to catalog-service: `GET http://catalog-service:3002/catalog/products/<id>`. 3-second timeout. On success, snapshot the product's name/price/image into the cart item. On failure (timeout, 404, service down), return an error to the user. This is the first real cross-service communication in the project — catalog and auth were both behind the gateway only. |
+| Flow | `POST /cart/items → cart-service → HTTP GET → catalog-service → MongoDB (or Redis cache) → returns product → cart-service snapshots name/price/image → HSET into Redis` |
+| Code pointer | `services/cart-service/src/utils/catalogClient.js` (HTTP client with timeout + error logging), usage in `src/routes/cart.routes.js` POST `/items` handler |
+| Trade-off | Synchronous REST creates coupling: if catalog-service is down, you can't add to cart. This is acceptable because the user needs to see the product page (catalog) to click "Add to Cart" anyway — if catalog is down, they can't browse products either. Alternative: cache product data locally in cart-service and validate asynchronously. But that adds complexity and could allow adding discontinued products. Price snapshots mean the cart may show stale prices — the order service will re-validate at checkout. |
+| Likely question | "What if the product price changes after the user adds it to the cart?" → The cart stores a snapshot of the price at add-time. We could add a background job to re-validate prices periodically, or re-validate on cart retrieval. At checkout, the order service MUST re-validate the current price from catalog to prevent stale-price exploitation. The cart is for display; the order is for billing. |

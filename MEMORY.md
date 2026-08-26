@@ -6,13 +6,13 @@ etc.) is being used.** Update it last, before ending the session. This is the on
 file every tool trusts to know "what's actually true right now" — code can be
 half-written, but this file should always reflect the real current state.
 
-Last updated: 2026-08-25 — Antigravity (Claude Opus 4.6 Thinking)
+Last updated: 2026-08-26 — Antigravity (Claude Opus 4.6 Thinking)
 
 ---
 
 ## 1. Current phase
 
-**Active phase:** Phase 3 — Cart Service *(Phases 0–2 complete)*
+**Active phase:** Phase 4 — Order + Inventory Services *(Phases 0–3 complete)*
 **Status:** Not started
 
 ## 2. Phase completion checklist
@@ -23,7 +23,7 @@ fully met for everything in that phase — not just "code exists."
 - [x] Phase 0 — Foundations (repo scaffold, docker-compose skeleton, gateway passthrough)
 - [x] Phase 1 — Auth Service
 - [x] Phase 2 — Catalog Service + Redis cache
-- [ ] Phase 3 — Cart Service
+- [x] Phase 3 — Cart Service
 - [ ] Phase 4 — Order + Inventory Services
 - [ ] Phase 5 — Payment integration
 - [ ] Phase 6 — Events, deployment, docs polish
@@ -33,11 +33,11 @@ fully met for everything in that phase — not just "code exists."
 
 | Service | Status | Notes |
 |---|---|---|
-| API Gateway | done | Express, /health, Helmet, CORS, structured JSON logging, proxies /api/auth/* → auth-service:3001, proxies /api/catalog/* → catalog-service:3002, Dockerfile |
+| API Gateway | done | Express, /health, Helmet, CORS, structured JSON logging, proxies /api/auth/* → auth-service:3001, proxies /api/catalog/* → catalog-service:3002, proxies /api/cart/* → cart-service:3003, Dockerfile |
 | Auth Service | done | Signup, login, JWT access+refresh rotation, RBAC (admin/customer), bcrypt, rate limiting (10/15min), Joi validation, /health with DB status, Sequelize+Postgres, Dockerfile |
 | Catalog Service | done | Products CRUD (pagination, filtering, sorting, full-text search), Categories CRUD (auto-slug, parent nesting), MongoDB+Mongoose, Redis cache-aside (5min/30min/1hr TTLs), image upload (multer, local disk), Joi validation, JWT auth for admin routes, /health with MongoDB+Redis status, Dockerfile |
+| Cart Service | done | Add/remove/update items, guest cart (x-guest-id header, 7d TTL), user cart (JWT, 30d TTL), cart merge on login, cross-service product validation (REST → catalog-service), Redis Hash data structure, optionalAuth middleware, Joi validation, /health with Redis status, Dockerfile |
 | User Service | not started | |
-| Cart Service | not started | |
 | Order Service | not started | |
 | Payment Service | not started | |
 | Inventory Service | not started | |
@@ -62,13 +62,23 @@ Status values to use: `not started`, `in progress`, `done`, `blocked`.
   Raw MongoDB driver would be faster but harder to explain and maintain. Resolved Phase 2.
 - **Search strategy: MongoDB text index** — basic full-text search on name + description
   with weighted relevance scoring. No typo tolerance. Upgrade path documented as
-  Elasticsearch/Atlas Search. Resolved Phase 2 (PRD.md §7 question answered: "no" to
-  typo tolerance unless time allows).
+  Elasticsearch/Atlas Search. Resolved Phase 2.
 - **Image upload: local disk (dev stand-in)** — multer to `uploads/products/` with UUID
   filenames. Documented as production CDN/S3 stand-in. Docker volume for persistence.
   Resolved Phase 2.
 - **Category hierarchy: single-level nesting** — optional `parentCategory` reference.
   Flat for now, extensible later. Resolved Phase 2.
+- **Guest checkout: allowed** — guests can add to cart without registering. Cart persists
+  7 days via `x-guest-id` header. Guest cart merges into user cart on login. Resolved
+  Phase 3 (PRD.md §7 question answered: "yes, guest checkout is allowed").
+- **Cart data store: Redis primary** — Redis is the source of truth for carts, not a
+  cache. No backing database. Hash data structure for O(1) per-item access. Resolved
+  Phase 3.
+- **Cart merge strategy: user takes precedence** — on merge, user's existing items win
+  over guest's for the same product. Guest-only items are added. Resolved Phase 3.
+- **Cross-service communication: REST for synchronous** — cart-service validates products
+  by calling catalog-service via REST (3s timeout). First real service-to-service call
+  in the project. Resolved Phase 3.
 
 ## 5. Known issues / blockers
 
@@ -83,9 +93,9 @@ agent session doesn't waste time re-litigating them.
   `http-proxy-middleware` because catalog-service doesn't exist yet. Replace the
   stub with a real proxy in Phase 2, don't re-debate whether to use a proxy now.
   **UPDATE Phase 2: stub removed, real proxy to catalog-service:3002 is live.**
-- Gateway now uses `http-proxy-middleware` for auth (`/api/auth/*` → auth-service:3001)
-  AND catalog (`/api/catalog/*` → catalog-service:3002).
-  This is the pattern to follow for all future services. Don't revert to stub routes.
+- Gateway now uses `http-proxy-middleware` for auth (`/api/auth/*` → auth-service:3001),
+  catalog (`/api/catalog/*` → catalog-service:3002), and cart (`/api/cart/*` →
+  cart-service:3003). This is the pattern to follow for all future services.
 - Auth service uses `sequelize.sync({ alter: true })` in dev for convenience.
   Don't switch to migrations until production deployment is a concern — sync is fine
   for the development workflow.
@@ -98,14 +108,24 @@ agent session doesn't waste time re-litigating them.
   Express strips the mount path before the proxy sees it, so regex doesn't match.
 - Catalog service auth middleware duplicates JWT verification logic from auth-service
   intentionally. Each service validates tokens independently — no shared npm library.
-  This is a deliberate trade-off: slight duplication vs. coupling. See
-  `services/catalog-service/src/middleware/authenticate.js` for the rationale.
-- Cache operations are all wrapped in try/catch with error swallowing. Redis failure
-  degrades to slower DB reads, never crashes the service. Don't add `throw` to cache
-  helpers — graceful degradation is the design goal.
+  This is a deliberate trade-off: slight duplication vs. coupling.
+- Cache operations in CATALOG service are all wrapped in try/catch with error swallowing.
+  Redis failure degrades to slower DB reads, never crashes the service. Don't add `throw`
+  to cache helpers — graceful degradation is the design goal.
+- Cart service uses `maxRetriesPerRequest: 3` (NOT null like catalog cache). This is
+  intentional — Redis IS the primary store for cart, so errors must propagate. For
+  catalog caching, errors are swallowed (cache miss = DB read). Different error handling
+  for different Redis roles.
+- Cart `/health` endpoint is at the root (`/health`), not at `/cart/health`. The gateway
+  proxy rewrites `/api/cart/*` → `/cart/*`, so the health endpoint is only accessible
+  internally (Docker healthcheck) not via gateway. This is by design — health checks
+  are for infrastructure, not clients.
+- `optionalAuth` middleware is cart-specific. Don't try to use `authenticate` (which
+  401s on failure) for cart routes — guests need to use the cart without auth.
 
 ## 7. Next recommended action
 
-"Start Phase 3: build the Cart Service with Redis-backed storage, add/remove/update
-quantity, guest cart with TTL, merge guest cart into user cart on login, and create
-`docs/cart.md`."
+"Start Phase 4: build the Order Service (PostgreSQL, Sequelize, order lifecycle with
+statuses PENDING → PAID → SHIPPED → DELIVERED → CANCELLED) and Inventory Service
+(stock management, reservation via RabbitMQ events). This phase introduces
+asynchronous messaging — the first RabbitMQ integration. Create `docs/orders.md`."

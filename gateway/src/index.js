@@ -11,6 +11,7 @@
  * Phase 0: stub route (/api/catalog/ping) — removed in Phase 2.
  * Phase 1: proxy to auth-service at /api/auth/*
  * Phase 2: proxy to catalog-service at /api/catalog/*
+ * Phase 3: proxy to cart-service at /api/cart/*
  *
  * IMPORTANT: Proxy routes are registered BEFORE express.json() body parsing.
  * http-proxy-middleware needs the raw request stream — if express.json() runs
@@ -30,6 +31,7 @@ const PORT = process.env.PORT || 3000;
 // Service URLs — resolved via Docker Compose service names
 const AUTH_SERVICE_URL = process.env.AUTH_SERVICE_URL || 'http://auth-service:3001';
 const CATALOG_SERVICE_URL = process.env.CATALOG_SERVICE_URL || 'http://catalog-service:3002';
+const CART_SERVICE_URL = process.env.CART_SERVICE_URL || 'http://cart-service:3003';
 
 // ---------------------------------------------------------------------------
 // Pre-proxy middleware (must run before proxies AND before body parsing)
@@ -117,6 +119,27 @@ app.use(
     target: CATALOG_SERVICE_URL,
     changeOrigin: true,
     pathRewrite: (path) => `/catalog${path}`,
+    on: {
+      proxyReq: (proxyReq, req) => {
+        proxyReq.setHeader('x-request-id', req.id);
+      },
+    },
+  })
+);
+
+/**
+ * /api/cart/* → Cart Service
+ *
+ * Cart requests (add/remove items, get cart, merge) are proxied to the
+ * cart-service container. Gateway passes through both JWT and x-guest-id
+ * headers so the cart service can resolve the cart identity.
+ */
+app.use(
+  '/api/cart',
+  createProxyMiddleware({
+    target: CART_SERVICE_URL,
+    changeOrigin: true,
+    pathRewrite: (path) => `/cart${path}`,
     on: {
       proxyReq: (proxyReq, req) => {
         proxyReq.setHeader('x-request-id', req.id);

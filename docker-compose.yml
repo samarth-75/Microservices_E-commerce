@@ -144,6 +144,36 @@ services:
       retries: 5
       start_period: 30s
 
+  # ---- Cart Service ----------------------------------------
+  # Handles shopping cart CRUD, guest/user carts, merge on login.
+  # Database: Redis (primary store — NOT a cache). No backing DB.
+  # Cross-service: validates products via REST call to catalog-service.
+  cart-service:
+    build:
+      context: ./services/cart-service
+      dockerfile: Dockerfile
+    container_name: cs-cart-service
+    restart: unless-stopped
+    environment:
+      PORT: 3003
+      NODE_ENV: development
+      REDIS_URL: redis://redis:6379
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-dev_access_secret_change_in_production}
+      CATALOG_SERVICE_URL: http://catalog-service:3002
+      GUEST_CART_TTL: 604800
+      USER_CART_TTL: 2592000
+    depends_on:
+      redis:
+        condition: service_healthy
+      catalog-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3003/health', (r) => { process.exit(r.statusCode === 200 ? 0 : 1) }).on('error', () => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
   # ---- API Gateway -------------------------------------------
   gateway:
     build:
@@ -156,6 +186,7 @@ services:
       NODE_ENV: development
       AUTH_SERVICE_URL: http://auth-service:3001
       CATALOG_SERVICE_URL: http://catalog-service:3002
+      CART_SERVICE_URL: http://cart-service:3003
     ports:
       - "${GATEWAY_PORT:-3000}:3000"
     depends_on:
@@ -170,6 +201,8 @@ services:
       auth-service:
         condition: service_healthy
       catalog-service:
+        condition: service_healthy
+      cart-service:
         condition: service_healthy
 
 volumes:
