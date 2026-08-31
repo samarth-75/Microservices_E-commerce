@@ -248,3 +248,56 @@ Scaling:
 | Code pointer | `services/cart-service/src/utils/catalogClient.js` (HTTP client with timeout + error logging), usage in `src/routes/cart.routes.js` POST `/items` handler |
 | Trade-off | Synchronous REST creates coupling: if catalog-service is down, you can't add to cart. This is acceptable because the user needs to see the product page (catalog) to click "Add to Cart" anyway — if catalog is down, they can't browse products either. Alternative: cache product data locally in cart-service and validate asynchronously. But that adds complexity and could allow adding discontinued products. Price snapshots mean the cart may show stale prices — the order service will re-validate at checkout. |
 | Likely question | "What if the product price changes after the user adds it to the cart?" → The cart stores a snapshot of the price at add-time. We could add a background job to re-validate prices periodically, or re-validate on cart retrieval. At checkout, the order service MUST re-validate the current price from catalog to prevent stale-price exploitation. The cart is for display; the order is for billing. |
+
+---
+
+### Order Lifecycle & Status Machine — order-service (Phase 4)
+
+| Field | Notes |
+|---|---|
+| Problem | Orders need a clear, auditable lifecycle. The status must transition through a defined set of states (PENDING → CONFIRMED → PAID → SHIPPED → DELIVERED), and invalid transitions must be rejected. Once an order is paid, it must be immutable for auditability. |
+| Design choice | Status stored as a PostgreSQL ENUM with a STATUS_TRANSITIONS map defining valid transitions from each state. Transition validation happens at the route level before any DB write. Two terminal states (DELIVERED, CANCELLED) — once reached, no further changes allowed. Orders become immutable after PAID status. JSONB for shippingAddress (flexible, queryable without an extra table). UUID primary keys everywhere. |
+| Flow | `POST /orders → authenticate → fetch cart (REST → cart-service) → re-validate prices (REST → catalog-service per item) → Sequelize transaction: create Order + OrderItems → publish order.created (RabbitMQ) → clear cart (REST, non-fatal) → 201 response` |
+| Code pointer | `services/order-service/src/models/Order.js` (ENUM + STATUS_TRANSITIONS map), `src/routes/order.routes.js` (POST / handler — cart fetch, price validation, transaction, RabbitMQ publish), `src/models/OrderItem.js` (snapshot fields) |
+| Trade-off | Re-validating prices per item via REST at checkout adds latency (N sequential HTTP calls), but ensures billing correctness. Alternative: batch price endpoint on catalog-service. Not implemented because the catalog already caches responses in Redis, so individual lookups are fast. Another trade-off: the order may be created (PENDING) even if RabbitMQ publish fails — the order exists but inventory is never reserved. Fix: outbox pattern (write event to DB + poll), but that's over-engineered for this project. |
+| Likely question | "Why is the order immutable after PAID?" → Auditability. If a customer disputes a charge, you need to show exactly what was ordered and at what price. If orders could be edited post-payment, you'd lose that evidence trail. Corrections happen via refund records, not by modifying the original order. This is standard in real e-commerce (Amazon doesn't edit your order after you pay — they issue credits). |
+
+---
+
+### Inventory Reservation with Atomic SQL — inventory-service (Phase 4)
+
+| Field | Notes |
+|---|---|
+| Problem | When an order is placed, stock must be reserved to prevent overselling. Two concurrent orders for the last 3 units of a product must not both succeed. The reservation must be all-or-nothing — if any item in the order can't be reserved, none should be. |
+| Design choice | Atomic SQL UPDATE with a WHERE clause: `UPDATE inventory SET reservedStock = reservedStock + :qty WHERE productId = :pid AND totalStock - reservedStock >= :qty`. If affected rows = 0, stock is insufficient. Wrapped in a Sequelize transaction for all-or-nothing across multiple items. Separate Reservation table tracks per-order reservations for proper release on cancellation. Two-field stock model: totalStock (warehouse total) vs. reservedStock (pending orders). |
+| Flow | `RabbitMQ delivers order.created → for each item: atomic UPDATE with WHERE check → if ALL succeed: create Reservation records, commit, publish inventory.reserved → if ANY fail: rollback, publish inventory.failed` |
+| Code pointer | `services/inventory-service/src/consumers/orderCreated.consumer.js` (reservation logic), `src/consumers/orderCancelled.consumer.js` (stock release), `src/models/Inventory.js` (totalStock/reservedStock split + virtual availableStock), `src/models/Reservation.js` (per-order tracking) |
+| Trade-off | The atomic UPDATE approach is "optimistic locking" — no explicit database locks, so it's performant under normal load. Under extreme concurrency (flash sale), many UPDATEs would fail and orders would be cancelled. Production fix: add a queue/semaphore for high-demand items, or use `SELECT FOR UPDATE` (pessimistic locking) for items with stock < 10. Not implemented because flash sales are out of scope (PRD.md §4). |
+| Likely question | "How do you prevent overselling without explicit database locks?" → The WHERE clause in the UPDATE acts as a database-level guard. PostgreSQL's MVCC ensures that two concurrent transactions see consistent snapshots. Only one can succeed in reducing the available stock below zero — the other's UPDATE affects 0 rows and we treat that as insufficient stock. It's the optimistic concurrency control pattern. |
+
+---
+
+### RabbitMQ Event-Driven Architecture — Phase 4
+
+| Field | Notes |
+|---|---|
+| Problem | The order placement flow spans multiple services (Order, Inventory, later Notification and Analytics). If this were all synchronous REST, the checkout request would be slow (sequential calls) and tightly coupled (any downstream failure fails the order). We need asynchronous communication for operations that don't require an immediate response. |
+| Design choice | RabbitMQ with topic exchanges. Two exchanges: `order_events` (Order Service publishes), `inventory_events` (Inventory Service publishes). Topic exchange allows routing-key-based filtering — consumers bind with patterns they care about. Each consumer has its own named, durable queue. Prefetch 1 for reliable one-at-a-time processing. Messages are persistent (survive broker restarts). Acknowledgment: ack on success, nack+requeue on transient errors, ack on permanent errors (to avoid infinite loops). |
+| Flow | `Order creates (PENDING) → publishes order.created to order_events exchange → Inventory consumes from inventory.order_created queue → reserves stock → publishes inventory.reserved to inventory_events exchange → Order consumes from order.inventory_response queue → updates order to CONFIRMED` |
+| Code pointer | `services/order-service/src/config/rabbitmq.js` (connection, topology, publish), `services/inventory-service/src/config/rabbitmq.js` (consumer-side topology), `services/order-service/src/consumers/inventoryResponse.consumer.js`, `services/inventory-service/src/consumers/orderCreated.consumer.js`, `docs/messaging.md` (complete topology and schema reference) |
+| Trade-off | RabbitMQ over Kafka: RabbitMQ is simpler for task-queue semantics (process once, ack, delete). Kafka would give event replay and higher throughput but adds operational complexity and is harder to explain in a short interview. At-least-once delivery means consumers should be idempotent — currently, the order status check (`if status !== 'PENDING'`) provides idempotency for the inventory response consumer. No dead-letter queue yet (stretch goal). |
+| Likely question | "What happens if the Inventory Service is down when the order is created?" → The message sits in the RabbitMQ queue (persisted to disk) until the Inventory Service comes back up. RabbitMQ acts as a buffer. The order stays in PENDING status. When the service recovers, it processes the queued messages. This is the key benefit of async messaging over REST — the publisher doesn't need the consumer to be available at the moment of publishing. |
+
+---
+
+### Cross-Service Order Placement Flow — Phase 4
+
+| Field | Notes |
+|---|---|
+| Problem | Placing an order requires data from three services (Cart, Catalog, Inventory) and coordination across two communication patterns (synchronous REST, asynchronous events). This is the most complex cross-service flow in the project and the one most likely to come up in a system design interview. |
+| Design choice | Hybrid approach: synchronous REST for data the user is waiting on (cart contents, price validation), asynchronous events for operations that can happen in the background (inventory reservation, notifications). The "spinner rule" from Technical_Specification.md §3 guided every decision. Payment invocation (Phase 5) will also be synchronous REST — the user needs immediate feedback on payment success/failure. |
+| Flow | `Customer → Gateway → Order Service → [REST: Cart Service] → [REST: Catalog Service × N items] → [DB: create Order + Items] → [RabbitMQ: publish order.created] → [REST: clear Cart] → 201 to Customer. Then async: [RabbitMQ → Inventory Service → reserve stock → publish result → RabbitMQ → Order Service → update status]` |
+| Code pointer | `services/order-service/src/routes/order.routes.js` POST `/` (orchestration), `src/utils/cartClient.js` (REST to cart), `src/utils/catalogClient.js` (REST to catalog), `src/config/rabbitmq.js` (event publishing), `src/consumers/inventoryResponse.consumer.js` (async status update) |
+| Trade-off | The orchestration approach (Order Service calls other services) is simpler than choreography (services react to events independently). Downside: Order Service becomes a "god service" that knows about Cart, Catalog, and Inventory. In a larger system, you'd consider a Saga pattern with a separate orchestrator. For this project, the direct approach is easier to explain and debug. |
+| Likely question | "Walk me through what happens, service by service, when an order is placed." → [Use the flow above, expanding each step into 1-2 sentences. End with: "The entire synchronous part takes about 500ms. The inventory reservation happens in ~50ms asynchronously. The customer sees their order immediately with PENDING status, and it updates to CONFIRMED within a second."] |
+

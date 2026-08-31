@@ -14,9 +14,13 @@
 -- Auth Service database
 CREATE DATABASE commercesphere_auth;
 
+-- Order Service database
+CREATE DATABASE commercesphere_orders;
+
+-- Inventory Service database
+CREATE DATABASE commercesphere_inventory;
+
 -- Future services will get their own databases here:
--- CREATE DATABASE commercesphere_orders;
 -- CREATE DATABASE commercesphere_payments;
--- CREATE DATABASE commercesphere_inventory;
 -- CREATE DATABASE commercesphere_analytics;
 -- CREATE DATABASE commercesphere_users;

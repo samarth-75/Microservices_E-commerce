@@ -32,6 +32,8 @@ const PORT = process.env.PORT || 3000;
 const AUTH_SERVICE_URL = process.env.AUTH_SERVICE_URL || 'http://auth-service:3001';
 const CATALOG_SERVICE_URL = process.env.CATALOG_SERVICE_URL || 'http://catalog-service:3002';
 const CART_SERVICE_URL = process.env.CART_SERVICE_URL || 'http://cart-service:3003';
+const ORDER_SERVICE_URL = process.env.ORDER_SERVICE_URL || 'http://order-service:3004';
+const INVENTORY_SERVICE_URL = process.env.INVENTORY_SERVICE_URL || 'http://inventory-service:3005';
 
 // ---------------------------------------------------------------------------
 // Pre-proxy middleware (must run before proxies AND before body parsing)
@@ -140,6 +142,47 @@ app.use(
     target: CART_SERVICE_URL,
     changeOrigin: true,
     pathRewrite: (path) => `/cart${path}`,
+    on: {
+      proxyReq: (proxyReq, req) => {
+        proxyReq.setHeader('x-request-id', req.id);
+      },
+    },
+  })
+);
+
+/**
+ * /api/orders/* → Order Service
+ *
+ * Order requests (create, list, get, status update, cancel) are proxied to
+ * the order-service container. Requires JWT authentication (handled by
+ * order-service, not the gateway).
+ */
+app.use(
+  '/api/orders',
+  createProxyMiddleware({
+    target: ORDER_SERVICE_URL,
+    changeOrigin: true,
+    pathRewrite: (path) => `/orders${path}`,
+    on: {
+      proxyReq: (proxyReq, req) => {
+        proxyReq.setHeader('x-request-id', req.id);
+      },
+    },
+  })
+);
+
+/**
+ * /api/inventory/* → Inventory Service
+ *
+ * Inventory management requests (admin-only: set/get/update stock levels)
+ * are proxied to the inventory-service container.
+ */
+app.use(
+  '/api/inventory',
+  createProxyMiddleware({
+    target: INVENTORY_SERVICE_URL,
+    changeOrigin: true,
+    pathRewrite: (path) => `/inventory${path}`,
     on: {
       proxyReq: (proxyReq, req) => {
         proxyReq.setHeader('x-request-id', req.id);
