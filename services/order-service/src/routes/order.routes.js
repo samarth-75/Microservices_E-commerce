@@ -448,4 +448,91 @@ router.put(
     }
 );
 
+// -----------------------------------------------------------------------
+// POST /:id/pay — Initiate payment for a CONFIRMED order
+// -----------------------------------------------------------------------
+router.post(
+    '/:id/pay',
+    authenticate,
+    async (req, res) => {
+        try {
+            const order = await Order.findByPk(req.params.id);
+
+            if (!order) {
+                return res.status(404).json({
+                    error: 'Not Found',
+                    message: 'Order not found.',
+                });
+            }
+
+            // Customers can only pay for their own orders
+            if (order.userId !== req.user.id) {
+                return res.status(403).json({
+                    error: 'Forbidden',
+                    message: 'You do not have access to this order.',
+                });
+            }
+
+            // Can only pay for CONFIRMED orders
+            if (order.status !== 'CONFIRMED') {
+                return res.status(400).json({
+                    error: 'Invalid Order Status',
+                    message: `Order must be CONFIRMED to initiate payment. Current status: ${order.status}`,
+                });
+            }
+
+            // Forward to Payment Service
+            const PAYMENT_SERVICE_URL = process.env.PAYMENT_SERVICE_URL || 'http://payment-service:3006';
+            const authToken = req.headers.authorization.split(' ')[1];
+
+            const response = await fetch(`${PAYMENT_SERVICE_URL}/payments/create-session`, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${authToken}`,
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ orderId: order.id }),
+                signal: AbortSignal.timeout(10000),
+            });
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                return res.status(response.status).json(data);
+            }
+
+            console.log(JSON.stringify({
+                timestamp: new Date().toISOString(),
+                level: 'info',
+                service: 'order-service',
+                requestId: req.id,
+                message: 'Payment session created via payment-service',
+                orderId: order.id,
+                sessionUrl: data.sessionUrl,
+            }));
+
+            res.json({
+                message: 'Payment session created. Redirect to Stripe to complete payment.',
+                sessionUrl: data.sessionUrl,
+                sessionId: data.sessionId,
+                paymentId: data.paymentId,
+            });
+        } catch (err) {
+            console.error(JSON.stringify({
+                timestamp: new Date().toISOString(),
+                level: 'error',
+                service: 'order-service',
+                requestId: req.id,
+                message: 'Failed to initiate payment',
+                error: err.message,
+            }));
+
+            res.status(500).json({
+                error: 'Internal Server Error',
+                message: 'Failed to initiate payment.',
+            });
+        }
+    }
+);
+
 module.exports = router;

@@ -20,7 +20,9 @@ CREATE DATABASE commercesphere_orders;
 -- Inventory Service database
 CREATE DATABASE commercesphere_inventory;
 
+-- Payment Service database
+CREATE DATABASE commercesphere_payments;
+
 -- Future services will get their own databases here:
--- CREATE DATABASE commercesphere_payments;
 -- CREATE DATABASE commercesphere_analytics;
 -- CREATE DATABASE commercesphere_users;

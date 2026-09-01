@@ -34,6 +34,7 @@ const CATALOG_SERVICE_URL = process.env.CATALOG_SERVICE_URL || 'http://catalog-s
 const CART_SERVICE_URL = process.env.CART_SERVICE_URL || 'http://cart-service:3003';
 const ORDER_SERVICE_URL = process.env.ORDER_SERVICE_URL || 'http://order-service:3004';
 const INVENTORY_SERVICE_URL = process.env.INVENTORY_SERVICE_URL || 'http://inventory-service:3005';
+const PAYMENT_SERVICE_URL = process.env.PAYMENT_SERVICE_URL || 'http://payment-service:3006';
 
 // ---------------------------------------------------------------------------
 // Pre-proxy middleware (must run before proxies AND before body parsing)
@@ -191,6 +192,30 @@ app.use(
   })
 );
 
+/**
+ * /api/payments/* → Payment Service
+ *
+ * Payment requests (create Stripe session, webhook, get payment, refund)
+ * are proxied to the payment-service container.
+ *
+ * IMPORTANT: The webhook route (/api/payments/webhook) receives raw body
+ * from Stripe. The gateway proxy passes the body through as-is because
+ * express.json() is mounted AFTER proxies. The payment-service handles
+ * express.raw() internally for the webhook route.
+ */
+app.use(
+  '/api/payments',
+  createProxyMiddleware({
+    target: PAYMENT_SERVICE_URL,
+    changeOrigin: true,
+    pathRewrite: (path) => `/payments${path}`,
+    on: {
+      proxyReq: (proxyReq, req) => {
+        proxyReq.setHeader('x-request-id', req.id);
+      },
+    },
+  })
+);
 // ---------------------------------------------------------------------------
 // Body parsing — AFTER proxies (proxied routes don't need gateway-side parsing)
 // ---------------------------------------------------------------------------

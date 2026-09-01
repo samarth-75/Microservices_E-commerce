@@ -189,6 +189,7 @@ services:
       CART_SERVICE_URL: http://cart-service:3003
       ORDER_SERVICE_URL: http://order-service:3004
       INVENTORY_SERVICE_URL: http://inventory-service:3005
+      PAYMENT_SERVICE_URL: http://payment-service:3006
     ports:
       - "${GATEWAY_PORT:-3000}:3000"
     depends_on:
@@ -209,6 +210,8 @@ services:
       order-service:
         condition: service_healthy
       inventory-service:
+        condition: service_healthy
+      payment-service:
         condition: service_healthy
 
   # ---- Order Service -------------------------------------------
@@ -234,6 +237,7 @@ services:
       RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-commercesphere}:${RABBITMQ_DEFAULT_PASS:-changeme_rabbit}@rabbitmq:5672
       CART_SERVICE_URL: http://cart-service:3003
       CATALOG_SERVICE_URL: http://catalog-service:3002
+      PAYMENT_SERVICE_URL: http://payment-service:3006
     depends_on:
       postgres:
         condition: service_healthy
@@ -282,10 +286,47 @@ services:
       retries: 5
       start_period: 30s
 
+  # ---- Payment Service ------------------------------------------
+  # Handles Stripe Checkout Sessions, webhook verification, idempotent
+  # charge handling, and refunds.
+  # Database: PostgreSQL (database-per-service — uses commercesphere_payments DB).
+  # External: Stripe API (sandbox/test mode only).
+  # Cross-service: REST calls to order-service (verify order, update status).
+  payment-service:
+    build:
+      context: ./services/payment-service
+      dockerfile: Dockerfile
+    container_name: cs-payment-service
+    restart: unless-stopped
+    environment:
+      PORT: 3006
+      NODE_ENV: development
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${PAYMENT_DB_NAME:-commercesphere_payments}
+      DB_USER: ${POSTGRES_USER:-commercesphere}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-changeme_pg}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-dev_access_secret_change_in_production}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-sk_test_replace_me_with_real_key}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-whsec_XXXXXXXXXXXXXXXXXXXXXXXX}
+      STRIPE_SUCCESS_URL: ${STRIPE_SUCCESS_URL:-http://localhost:5173/checkout/success?session_id={CHECKOUT_SESSION_ID}}
+      STRIPE_CANCEL_URL: ${STRIPE_CANCEL_URL:-http://localhost:5173/checkout/cancel}
+      ORDER_SERVICE_URL: http://order-service:3004
+    depends_on:
+      postgres:
+        condition: service_healthy
+      order-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3006/health', (r) => { process.exit(r.statusCode === 200 ? 0 : 1) }).on('error', () => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
 volumes:
   pg_data:
   mongo_data:
   redis_data:
   rabbit_data:
   catalog_uploads:
-

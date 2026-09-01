@@ -301,3 +301,41 @@ Scaling:
 | Trade-off | The orchestration approach (Order Service calls other services) is simpler than choreography (services react to events independently). Downside: Order Service becomes a "god service" that knows about Cart, Catalog, and Inventory. In a larger system, you'd consider a Saga pattern with a separate orchestrator. For this project, the direct approach is easier to explain and debug. |
 | Likely question | "Walk me through what happens, service by service, when an order is placed." → [Use the flow above, expanding each step into 1-2 sentences. End with: "The entire synchronous part takes about 500ms. The inventory reservation happens in ~50ms asynchronously. The customer sees their order immediately with PENDING status, and it updates to CONFIRMED within a second."] |
 
+---
+
+### Stripe Webhook Verification & Idempotent Payment Handling — payment-service (Phase 5)
+
+| Field | Notes |
+|---|---|
+| Problem | Payment events come from Stripe via webhooks. We cannot blindly trust incoming webhook requests — an attacker could forge them. We also can't assume webhooks arrive exactly once — Stripe may retry on timeout. The system must be secure against forgery and safe under duplicate delivery. |
+| Design choice | Stripe webhook signature verification using `stripe.webhooks.constructEvent(rawBody, sig, webhookSecret)`. This function: (1) extracts the timestamp and signature from the `stripe-signature` header, (2) computes HMAC-SHA256 of `timestamp.rawBody` using the webhook secret, (3) compares signatures, (4) rejects if timestamp is too old (replay protection). Idempotency: `orderId` is the idempotency key (unique constraint in DB). Webhook handler checks `payment.status !== 'COMPLETED'` before processing. |
+| Flow | `Stripe fires webhook → Payment Service receives POST /payments/webhook → verify signature with stripe.webhooks.constructEvent → find Payment by stripeSessionId → if already COMPLETED, skip (idempotent) → update Payment to COMPLETED → REST call to Order Service: PUT /orders/:orderId/status { status: 'PAID' } → return 200 to Stripe` |
+| Code pointer | `services/payment-service/src/routes/payment.routes.js` POST `/webhook` handler + `handleCheckoutCompleted` function, `src/index.js` (express.raw middleware ordering), `src/models/Payment.js` (unique constraint on idempotencyKey) |
+| Trade-off | The raw body requirement for signature verification means the webhook route must use `express.raw()` instead of `express.json()`. This requires careful middleware ordering in `src/index.js` — raw body on the webhook path, parsed JSON on everything else. If express.json() runs first, verification always fails. We mount express.raw() specifically on `/payments/webhook` before the global express.json(). A common production bug — documented here so future developers don't break it. |
+| Likely question | "How do you prevent someone from forging a Stripe webhook?" → Stripe includes an HMAC-SHA256 signature in the `stripe-signature` header, computed using the webhook secret (known only to Stripe and our server). We verify this signature using `stripe.webhooks.constructEvent()`. If the signature doesn't match — whether because the payload was tampered with or the secret is wrong — the event is rejected with a 400. Additionally, the signature includes a timestamp to prevent replay attacks. |
+
+---
+
+### Stripe Checkout Sessions vs PaymentIntents — payment-service (Phase 5)
+
+| Field | Notes |
+|---|---|
+| Problem | Stripe offers two integration models: (1) Checkout Sessions — redirect to Stripe's hosted page, (2) PaymentIntents — collect card details on your own frontend. We need to choose one and be able to explain why. |
+| Design choice | Stripe Checkout Sessions. The customer is redirected to Stripe's hosted page for payment. Card numbers never touch our servers. We create the session server-side, return the URL, and the customer pays on Stripe's page. When payment completes, Stripe fires a webhook. |
+| Flow | `Customer clicks Pay → POST /orders/:id/pay → Order Service verifies CONFIRMED → proxies to Payment Service → Payment Service creates Stripe Checkout Session → returns sessionUrl → customer redirects to Stripe → pays → Stripe fires checkout.session.completed webhook → Payment Service updates status` |
+| Code pointer | `services/payment-service/src/routes/payment.routes.js` POST `/create-session`, `services/order-service/src/routes/order.routes.js` POST `/:id/pay` |
+| Trade-off | Checkout Sessions are less customizable than PaymentIntents (can't embed a card form in our UI), but they're significantly simpler and safer: (1) No PCI compliance burden — card data never reaches our servers, (2) Stripe handles 3D Secure, card validation, error display, (3) Fewer frontend changes needed, (4) Stripe itself recommends Checkout for new integrations. The PaymentIntents API would be needed for embedded card forms, saved payment methods, or subscriptions — none of which are in scope (PRD.md §4). |
+| Likely question | "Why didn't you use Stripe Elements or PaymentIntents?" → Checkout Sessions are recommended by Stripe for standard one-time payments. They eliminate PCI scope entirely because card data never touches our servers. PaymentIntents would be necessary if we needed an embedded card form or saved payment methods, but those features are out of scope for v1. The trade-off is customization vs. simplicity — we chose simplicity because this is a portfolio project where the architecture matters more than the checkout UI. |
+
+---
+
+### Payment → Order Status Transition (CONFIRMED → PAID) — Phase 5
+
+| Field | Notes |
+|---|---|
+| Problem | After Stripe confirms payment, the order must transition from CONFIRMED to PAID. This cross-service status update happens inside the webhook handler. The Payment Service is the authority on payment completion, but the Order Service owns the order status. |
+| Design choice | Synchronous REST call from Payment Service → Order Service inside the webhook handler. The Payment Service creates a short-lived (30s) internal service JWT with `role: 'admin'` to authorize the status update. This happens AFTER the Payment record is updated to COMPLETED, so if the Order update fails, the payment is still recorded (and can be reconciled manually). |
+| Flow | `Webhook handler: update Payment to COMPLETED → sign 30s admin JWT → PUT order-service/orders/:orderId/status { status: 'PAID' } → log success or log CRITICAL on failure` |
+| Code pointer | `services/payment-service/src/utils/orderClient.js` (`updateOrderStatus` — signs internal service token), `services/payment-service/src/routes/payment.routes.js` (`handleCheckoutCompleted` function) |
+| Trade-off | The internal service JWT is a pragmatic choice for Docker-network communication. In production: use service mesh mTLS (Istio/Linkerd), API keys, or OAuth2 client credentials. If the Order update fails after payment is confirmed, we have an inconsistency (payment exists, order still CONFIRMED). We log this at CRITICAL level. Production fix: reconciliation job that periodically checks for COMPLETED payments with non-PAID orders. Not implemented because the Docker network is reliable and this edge case is rare. |
+| Likely question | "What if the Payment Service confirms payment but fails to update the Order to PAID?" → This is a distributed consistency problem. We mitigate it by: (1) updating the Payment record first (so the money is tracked), (2) logging at CRITICAL level if the Order update fails, (3) the Payment record has the orderId, so a reconciliation job can find mismatches. In production, we'd add a dead-letter queue or a scheduled reconciliation task. The key insight is: it's better to have the payment recorded and the order not updated (fixable) than to have the order updated and the payment not recorded (money lost). |
