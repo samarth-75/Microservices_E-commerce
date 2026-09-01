@@ -191,7 +191,7 @@ async function start() {
             }));
         }
 
-        if (!process.env.STRIPE_WEBHOOK_SECRET || process.env.STRIPE_WEBHOOK_SECRET === 'whsec_XXXXXXXXXXXXXXXXXXXXXXXX') {
+        if (!process.env.STRIPE_WEBHOOK_SECRET || process.env.STRIPE_WEBHOOK_SECRET === 'whsec_replace_me_with_real_key') {
             console.warn(JSON.stringify({
                 timestamp: new Date().toISOString(),
                 level: 'warn',

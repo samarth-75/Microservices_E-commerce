@@ -308,7 +308,7 @@ services:
       DB_PASSWORD: ${POSTGRES_PASSWORD:-changeme_pg}
       JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-dev_access_secret_change_in_production}
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-sk_test_replace_me_with_real_key}
-      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-whsec_XXXXXXXXXXXXXXXXXXXXXXXX}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-whsec_replace_me_with_real_key}
       STRIPE_SUCCESS_URL: ${STRIPE_SUCCESS_URL:-http://localhost:5173/checkout/success?session_id={CHECKOUT_SESSION_ID}}
       STRIPE_CANCEL_URL: ${STRIPE_CANCEL_URL:-http://localhost:5173/checkout/cancel}
       ORDER_SERVICE_URL: http://order-service:3004
