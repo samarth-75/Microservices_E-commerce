@@ -339,3 +339,42 @@ Scaling:
 | Code pointer | `services/payment-service/src/utils/orderClient.js` (`updateOrderStatus` — signs internal service token), `services/payment-service/src/routes/payment.routes.js` (`handleCheckoutCompleted` function) |
 | Trade-off | The internal service JWT is a pragmatic choice for Docker-network communication. In production: use service mesh mTLS (Istio/Linkerd), API keys, or OAuth2 client credentials. If the Order update fails after payment is confirmed, we have an inconsistency (payment exists, order still CONFIRMED). We log this at CRITICAL level. Production fix: reconciliation job that periodically checks for COMPLETED payments with non-PAID orders. Not implemented because the Docker network is reliable and this edge case is rare. |
 | Likely question | "What if the Payment Service confirms payment but fails to update the Order to PAID?" → This is a distributed consistency problem. We mitigate it by: (1) updating the Payment record first (so the money is tracked), (2) logging at CRITICAL level if the Order update fails, (3) the Payment record has the orderId, so a reconciliation job can find mismatches. In production, we'd add a dead-letter queue or a scheduled reconciliation task. The key insight is: it's better to have the payment recorded and the order not updated (fixable) than to have the order updated and the payment not recorded (money lost). |
+
+---
+
+### RabbitMQ Fan-Out Pattern with Topic Exchanges — notification-service + analytics-service (Phase 6)
+
+| Field | Notes |
+|---|---|
+| Problem | Multiple services (Inventory, Notification, Analytics) need to react to the same order events independently. If we used a single queue, only one consumer would get each message. We need each service to process every event without interfering with each other. |
+| Design choice | Topic exchange with per-service queues. The `order_events` exchange is shared, but each consumer creates its own queue (`inventory.order_created`, `notification.order_events`, `analytics.order_events`) and binds with routing key patterns. RabbitMQ delivers a copy of each message to every bound queue. Each consumer processes independently — Notification failure never blocks Analytics or Inventory. |
+| Flow | `Order Service publishes order.created → order_events exchange → RabbitMQ routes to 3 queues: inventory.order_created (Inventory), notification.order_events (Notification), analytics.order_events (Analytics) → each consumer processes independently` |
+| Code pointer | `services/notification-service/src/config/rabbitmq.js` (queue: `notification.order_events`), `services/analytics-service/src/config/rabbitmq.js` (queue: `analytics.order_events`), `services/order-service/src/config/rabbitmq.js` (publisher) |
+| Trade-off | Each queue stores its own copy of the message, so disk usage scales with the number of consumers. This is acceptable for our throughput. With millions of events/second, we'd consider Kafka (consumer groups with offset tracking, single message copy). For our scale, RabbitMQ's simplicity wins. Adding a new consumer is just: create queue + bind to exchange — no publisher changes needed. |
+| Likely question | "How do you add a new event consumer without changing existing services?" → Create a new queue, bind it to the existing exchange with the routing keys it cares about. The publisher (Order Service) doesn't know or care about consumers — it just publishes to the exchange. This is the key benefit of topic exchanges over direct point-to-point communication. |
+
+---
+
+### CQRS-Lite: Analytics Service as an Independent Read Model — analytics-service (Phase 6)
+
+| Field | Notes |
+|---|---|
+| Problem | The Analytics Service needs order data to compute metrics (orders/day, top products, revenue). But it can't query the Order Service's database (database-per-service pattern). How does it get the data? |
+| Design choice | CQRS-lite (Command Query Responsibility Segregation). The Analytics Service consumes `order.created` events and builds its own denormalized data store — `OrderEvent` and `OrderItemEvent` tables optimized for aggregation queries. It's a separate read model, eventually consistent with the write model (Order Service). |
+| Flow | `Order Service publishes order.created → Analytics consumer creates OrderEvent + OrderItemEvent records → Admin queries GET /analytics/orders/summary or /products/top → queries run against analytics DB only` |
+| Code pointer | `services/analytics-service/src/consumers/orderEvents.consumer.js` (event → DB), `services/analytics-service/src/routes/analytics.routes.js` (SQL aggregation queries), `services/analytics-service/src/models/OrderEvent.js` (denormalized schema) |
+| Trade-off | Data in analytics DB is eventually consistent — there's a sub-second delay between order creation and analytics recording. This is acceptable because analytics doesn't need real-time precision. The OrderEvent table has a unique constraint on `orderId` for idempotent processing (safe against RabbitMQ redelivery). If we needed real-time analytics, we'd use Redis counters or stream processing. |
+| Likely question | "Isn't it wasteful to store order data in two databases?" → It's the CQRS pattern — the Order Service's database is optimized for writes (normalized, transactional), while the Analytics database is optimized for reads (denormalized, indexed for aggregation). Each can evolve independently. In production, the analytics DB could be a read replica or a data warehouse (Redshift, BigQuery). |
+
+---
+
+### Simulated Notification Pipeline — notification-service (Phase 6)
+
+| Field | Notes |
+|---|---|
+| Problem | Per PRD.md: "Email/SMS-style notifications on order state changes — can be simulated/logged instead of a real provider." The interesting part is the event pipeline, not the third-party integration. |
+| Design choice | Notification Service is a pure RabbitMQ consumer with no database and no REST API (beyond /health). It consumes order.created, order.cancelled, inventory.reserved, and inventory.failed events. For each event, it logs a structured JSON "notification" that includes channel (email/sms), recipient, subject, and body. The log format mirrors what a real SendGrid/Twilio API call would look like. |
+| Flow | `RabbitMQ event → Notification consumer → notifier.sendEmail() / notifier.sendSMS() → structured JSON log with channel, recipient, subject, body` |
+| Code pointer | `services/notification-service/src/services/notifier.js` (simulated send functions), `src/consumers/orderEvents.consumer.js`, `src/consumers/inventoryEvents.consumer.js` |
+| Trade-off | Simulating instead of integrating with SendGrid/Twilio saves time and avoids API key management, but doesn't demonstrate third-party integration patterns. The trade-off is intentional — the event pipeline architecture is the interview talking point, not the HTTP call to an email API. Swapping to a real provider is a single-function change in notifier.js. |
+| Likely question | "How would you swap in a real email provider?" → Replace `sendEmail()` in `notifier.js` with a real SendGrid SDK call. The function signature stays the same (to, subject, body). Add SendGrid API key to `.env.example` and docker-compose. Everything else (RabbitMQ topology, consumer logic, retry handling) stays unchanged — that's the value of the abstraction. |

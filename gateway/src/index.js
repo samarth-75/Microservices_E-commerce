@@ -216,6 +216,28 @@ app.use(
     },
   })
 );
+
+/**
+ * /api/analytics/* → Analytics Service
+ *
+ * Admin-only analytics endpoints (order summary, daily breakdown, top products).
+ * Notification Service is a pure consumer — no REST API, no proxy needed.
+ */
+const ANALYTICS_SERVICE_URL = process.env.ANALYTICS_SERVICE_URL || 'http://analytics-service:3008';
+
+app.use(
+  '/api/analytics',
+  createProxyMiddleware({
+    target: ANALYTICS_SERVICE_URL,
+    changeOrigin: true,
+    pathRewrite: (path) => `/analytics${path}`,
+    on: {
+      proxyReq: (proxyReq, req) => {
+        proxyReq.setHeader('x-request-id', req.id);
+      },
+    },
+  })
+);
 // ---------------------------------------------------------------------------
 // Body parsing — AFTER proxies (proxied routes don't need gateway-side parsing)
 // ---------------------------------------------------------------------------

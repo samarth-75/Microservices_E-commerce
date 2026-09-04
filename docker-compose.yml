@@ -190,6 +190,7 @@ services:
       ORDER_SERVICE_URL: http://order-service:3004
       INVENTORY_SERVICE_URL: http://inventory-service:3005
       PAYMENT_SERVICE_URL: http://payment-service:3006
+      ANALYTICS_SERVICE_URL: http://analytics-service:3008
     ports:
       - "${GATEWAY_PORT:-3000}:3000"
     depends_on:
@@ -212,6 +213,10 @@ services:
       inventory-service:
         condition: service_healthy
       payment-service:
+        condition: service_healthy
+      notification-service:
+        condition: service_healthy
+      analytics-service:
         condition: service_healthy
 
   # ---- Order Service -------------------------------------------
@@ -319,6 +324,61 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "node", "-e", "require('http').get('http://localhost:3006/health', (r) => { process.exit(r.statusCode === 200 ? 0 : 1) }).on('error', () => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---- Notification Service --------------------------------------
+  # Pure RabbitMQ consumer — listens to order/inventory events and
+  # logs simulated email/SMS notifications. No database, no REST API.
+  notification-service:
+    build:
+      context: ./services/notification-service
+      dockerfile: Dockerfile
+    container_name: cs-notification-service
+    restart: unless-stopped
+    environment:
+      PORT: 3007
+      NODE_ENV: development
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-commercesphere}:${RABBITMQ_DEFAULT_PASS:-changeme_rabbit}@rabbitmq:5672
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3007/health', (r) => { process.exit(r.statusCode === 200 ? 0 : 1) }).on('error', () => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---- Analytics Service ------------------------------------------
+  # RabbitMQ consumer + admin REST API. Consumes order events to build
+  # analytics data store, exposes sales metrics endpoints.
+  # Database: PostgreSQL (database-per-service — uses commercesphere_analytics DB).
+  analytics-service:
+    build:
+      context: ./services/analytics-service
+      dockerfile: Dockerfile
+    container_name: cs-analytics-service
+    restart: unless-stopped
+    environment:
+      PORT: 3008
+      NODE_ENV: development
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${ANALYTICS_DB_NAME:-commercesphere_analytics}
+      DB_USER: ${POSTGRES_USER:-commercesphere}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-changeme_pg}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-dev_access_secret_change_in_production}
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-commercesphere}:${RABBITMQ_DEFAULT_PASS:-changeme_rabbit}@rabbitmq:5672
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3008/health', (r) => { process.exit(r.statusCode === 200 ? 0 : 1) }).on('error', () => process.exit(1))"]
       interval: 10s
       timeout: 5s
       retries: 5

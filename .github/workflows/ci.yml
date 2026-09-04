@@ -1,0 +1,93 @@
+name: CommerceSphere CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ---- Lint & Test ----
+  # Runs npm ci and npm test for each service in parallel.
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service:
+          - gateway
+          - services/auth-service
+          - services/catalog-service
+          - services/cart-service
+          - services/order-service
+          - services/inventory-service
+          - services/payment-service
+          - services/notification-service
+          - services/analytics-service
+      fail-fast: false # Don't cancel other jobs if one fails
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ${{ matrix.service }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ${{ matrix.service }}
+        run: npm ci
+
+      - name: Run linter (if configured)
+        working-directory: ${{ matrix.service }}
+        run: npm run lint --if-present
+
+      - name: Run tests (if configured)
+        working-directory: ${{ matrix.service }}
+        run: npm test --if-present
+
+  # ---- Docker Build ----
+  # Verifies that all Dockerfiles build successfully.
+  # Only runs on push to main (not on PRs) to save CI minutes.
+  docker-build:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - service: gateway
+            context: ./gateway
+          - service: auth-service
+            context: ./services/auth-service
+          - service: catalog-service
+            context: ./services/catalog-service
+          - service: cart-service
+            context: ./services/cart-service
+          - service: order-service
+            context: ./services/order-service
+          - service: inventory-service
+            context: ./services/inventory-service
+          - service: payment-service
+            context: ./services/payment-service
+          - service: notification-service
+            context: ./services/notification-service
+          - service: analytics-service
+            context: ./services/analytics-service
+      fail-fast: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t commercesphere/${{ matrix.service }}:${{ github.sha }} \
+            -t commercesphere/${{ matrix.service }}:latest \
+            ${{ matrix.context }}
+
+      - name: Verify image was built
+        run: docker images commercesphere/${{ matrix.service }}:latest

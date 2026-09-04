@@ -6,14 +6,14 @@ etc.) is being used.** Update it last, before ending the session. This is the on
 file every tool trusts to know "what's actually true right now" — code can be
 half-written, but this file should always reflect the real current state.
 
-Last updated: 2026-09-01 — Antigravity (Claude Opus 4.6 Thinking)
+Last updated: 2026-09-04 — Antigravity (Claude Opus 4.6 Thinking)
 
 ---
 
 ## 1. Current phase
 
-**Active phase:** Phase 5 — Payment Integration *(Phases 0–4 complete)*
-**Status:** Complete — code, docs, docker-compose, INTERVIEW_NOTES all written
+**Active phase:** Phase 6 — Events, deployment, docs polish *(Phases 0–5 complete)*
+**Status:** Complete — all services built, docs written, CI/CD configured
 
 ## 2. Phase completion checklist
 
@@ -26,23 +26,23 @@ fully met for everything in that phase — not just "code exists."
 - [x] Phase 3 — Cart Service
 - [x] Phase 4 — Order + Inventory Services
 - [x] Phase 5 — Payment integration
-- [ ] Phase 6 — Events, deployment, docs polish
+- [x] Phase 6 — Events, deployment, docs polish
 - [ ] Stretch goals (Prometheus/Grafana, circuit breaker, DLQ, read replicas)
 
 ## 3. Service status
 
 | Service | Status | Notes |
 |---|---|---|
-| API Gateway | done | Express, /health, Helmet, CORS, structured JSON logging, proxies /api/auth/* → auth-service:3001, proxies /api/catalog/* → catalog-service:3002, proxies /api/cart/* → cart-service:3003, proxies /api/orders/* → order-service:3004, proxies /api/inventory/* → inventory-service:3005, proxies /api/payments/* → payment-service:3006, Dockerfile |
+| API Gateway | done | Express, /health, Helmet, CORS, structured JSON logging, proxies /api/auth/* → auth-service:3001, proxies /api/catalog/* → catalog-service:3002, proxies /api/cart/* → cart-service:3003, proxies /api/orders/* → order-service:3004, proxies /api/inventory/* → inventory-service:3005, proxies /api/payments/* → payment-service:3006, proxies /api/analytics/* → analytics-service:3008, Dockerfile |
 | Auth Service | done | Signup, login, JWT access+refresh rotation, RBAC (admin/customer), bcrypt, rate limiting (10/15min), Joi validation, /health with DB status, Sequelize+Postgres, Dockerfile |
 | Catalog Service | done | Products CRUD (pagination, filtering, sorting, full-text search), Categories CRUD (auto-slug, parent nesting), MongoDB+Mongoose, Redis cache-aside (5min/30min/1hr TTLs), image upload (multer, local disk), Joi validation, JWT auth for admin routes, /health with MongoDB+Redis status, Dockerfile |
 | Cart Service | done | Add/remove/update items, guest cart (x-guest-id header, 7d TTL), user cart (JWT, 30d TTL), cart merge on login, cross-service product validation (REST → catalog-service), Redis Hash data structure, optionalAuth middleware, Joi validation, /health with Redis status, Dockerfile |
 | Order Service | done | Create order from cart, re-validate prices from catalog, order lifecycle (PENDING → CONFIRMED → PAID → SHIPPED → DELIVERED → CANCELLED), status transition validation, admin status update, customer cancel, POST /:id/pay (proxies to payment-service), Sequelize+Postgres, RabbitMQ publisher (order.created, order.cancelled), RabbitMQ consumer (inventory.reserved, inventory.failed), cross-service REST (cart-service, catalog-service, payment-service), JWT auth, RBAC, Joi validation, /health with Postgres+RabbitMQ status, Dockerfile |
 | Inventory Service | done | Stock management (totalStock/reservedStock split), atomic reservation via SQL UPDATE WHERE, all-or-nothing reservation with Sequelize transaction, per-order Reservation tracking, stock release on cancellation, admin CRUD endpoints, RabbitMQ consumer (order.created, order.cancelled), RabbitMQ publisher (inventory.reserved, inventory.failed), JWT auth, RBAC, Joi validation, /health with Postgres+RabbitMQ status, Dockerfile |
 | Payment Service | done | Stripe Checkout Sessions (sandbox/test mode), webhook signature verification, idempotent charge handling (orderId as idempotency key), payment lifecycle (PENDING → COMPLETED → REFUNDED / FAILED), session expiration handling, admin refund via Stripe API, cross-service REST (order-service for order verification + status update), internal service JWT for webhook → order update, express.raw() for webhook body, JSONB metadata for audit trail, Sequelize+Postgres, JWT auth, RBAC, Joi validation, /health with Postgres+Stripe config status, Dockerfile |
-| User Service | not started | |
-| Notification Service | not started | |
-| Analytics Service | not started | |
+| Notification Service | done | Pure RabbitMQ consumer (no database, no REST API beyond /health), consumes order.created, order.cancelled, inventory.reserved, inventory.failed events, simulated email/SMS via structured JSON logs, fan-out pattern with per-service queues, graceful shutdown, Dockerfile |
+| Analytics Service | done | RabbitMQ consumer + admin REST API, consumes order.created/cancelled events, builds denormalized analytics DB (CQRS-lite), OrderEvent + OrderItemEvent models, idempotent event recording (unique orderId), GET /analytics/orders/summary (revenue, count, avg), GET /analytics/orders/daily (daily breakdown), GET /analytics/products/top (top products by quantity), Sequelize+Postgres, JWT auth (admin-only), RBAC, Dockerfile |
+| User Service | not started | Out of scope — not in any PHASES.md phase |
 | Frontend | not started | |
 
 Status values to use: `not started`, `in progress`, `done`, `blocked`.
@@ -99,11 +99,22 @@ Status values to use: `not started`, `in progress`, `done`, `blocked`.
 - **Webhook → Order update auth: internal service JWT** — Payment Service signs a 30s
   admin JWT for the cross-service call. Production alternative: service mesh mTLS or
   OAuth2 client credentials. Resolved Phase 5.
+- **Notification simulation: structured JSON logs** — per PRD.md, the interesting part is
+  the event pipeline, not the third-party integration. Simulated via structured logs that
+  mirror real API call payloads. Swapping to SendGrid/Twilio is a single-function change.
+  Resolved Phase 6.
+- **Analytics data model: CQRS-lite** — Analytics Service consumes order events and builds
+  its own denormalized read model. Never queries Order Service's database. Eventually
+  consistent (sub-second delay). Resolved Phase 6.
+- **Fan-out pattern: per-service queues** — each consumer (Inventory, Notification,
+  Analytics) has its own queue bound to the shared `order_events` exchange. RabbitMQ
+  delivers a copy to each queue. Adding new consumers requires no publisher changes.
+  Resolved Phase 6.
 
 ## 5. Known issues / blockers
 
 - **Postgres init.sql only runs on first boot.** If `pg_data` volume already exists with
-  an older init.sql (before payments DB was added), the new database won't be created.
+  an older init.sql (before analytics DB was added), the new database won't be created.
   Fix: `docker-compose down -v` to reset volumes, then `docker-compose up -d`.
 - **Stripe keys required.** Payment Service starts but payment creation fails without
   valid `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` in `.env`. The health endpoint
@@ -119,7 +130,7 @@ agent session doesn't waste time re-litigating them.
   stub with a real proxy in Phase 2, don't re-debate whether to use a proxy now.
   **UPDATE Phase 2: stub removed, real proxy to catalog-service:3002 is live.**
 - Gateway now uses `http-proxy-middleware` for auth, catalog, cart, orders, inventory,
-  and payments. This is the pattern to follow for all future services.
+  payments, and analytics. This is the pattern to follow for all future services.
 - Auth service uses `sequelize.sync({ alter: true })` in dev for convenience.
   Don't switch to migrations until production deployment is a concern — sync is fine
   for the development workflow.
@@ -165,9 +176,20 @@ agent session doesn't waste time re-litigating them.
 - Order Service has a `POST /:id/pay` convenience route that proxies to Payment Service.
   This keeps Order Service as the orchestrator for the checkout flow. Don't move payment
   initiation to the frontend directly — the Order Service validates CONFIRMED status first.
+- Notification Service is consumer-only — no REST routes beyond /health, no database.
+  Don't add a REST API or database. The value is the event pipeline, not the notification
+  delivery mechanism.
+- Analytics Service uses per-service queues (`analytics.order_events`), NOT shared queues
+  with Inventory/Notification. Each consumer must have its own queue for the fan-out
+  pattern to work. Shared queues = competing consumers = only one gets each message.
+- GitHub push protection flags Stripe placeholders like `sk_test_XXX...` and
+  `whsec_XXX...`. Use `sk_test_replace_me_with_real_key` and
+  `whsec_replace_me_with_real_key` instead to avoid false positives.
 
 ## 7. Next recommended action
 
-"Start Phase 6: Notification Service (email/SMS simulation via console logging),
-Analytics Service (orders per period, top products), CI/CD with GitHub Actions,
-deployment docs, and overall docs polish. Also consider the Frontend (React + Vite)."
+"All 6 phases are complete. The backend is fully functional. Next options:
+1. **Frontend** (React + Vite + Redux Toolkit + Tailwind) — per AGENTS.md tech stack
+2. **Stretch goals** — Prometheus/Grafana monitoring, circuit breaker, dead-letter queues
+3. **Docker Compose full test** — `docker-compose down -v && docker-compose up -d --build`
+   to verify the entire stack starts from scratch."
